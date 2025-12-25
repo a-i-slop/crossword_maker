@@ -1,12 +1,15 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple, Any
+import argparse
+import csv
 import collections
 import itertools
+import json
+from pathlib import Path
 import random
 import re
-import json
+from dataclasses import dataclass, field
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple, Any
 
 Coord = Tuple[int, int]  # (x, y)
 
@@ -24,7 +27,6 @@ class Placement:
 class CrosswordLayout:
     """
     A sparse crossword-like word arrangement.
-
     Grid is stored as a dict from (x, y) -> letter. Any coordinate not in `grid` is a black cell.
     """
     clearance: int = 2
@@ -33,7 +35,7 @@ class CrosswordLayout:
     # For each occupied cell, which directions already occupy the cell (H and/or V).
     cell_dirs: Dict[Coord, Set[str]] = field(default_factory=lambda: collections.defaultdict(set))
 
-    # For each occupied cell, which placement indices occupy the cell (used to compute components).
+    # For each occupied cell, which placement indices occupy the cell.
     cell_words: Dict[Coord, List[int]] = field(default_factory=lambda: collections.defaultdict(list))
 
     # Index for fast candidate generation: letter -> coordinates where that letter exists.
@@ -255,21 +257,29 @@ class CrosswordLayout:
     def to_text(self, **render_kwargs) -> str:
         return "\n".join(self.render(**render_kwargs))
 
-    def save_ipuz(self, filename: str, title: str = "Sparse Crossword") -> None:
+    def save_ipuz(
+        self, 
+        filename: str, 
+        title: str = "Sparse Crossword", 
+        clues_map: Optional[Dict[str, str]] = None,
+        structure_map: Optional[Dict[str, str]] = None,
+    ) -> None:
         """
         Save the layout to an .ipuz file (JSON format).
         Generates standard crossword numbering and extracted clues.
+        
+        :param clues_map: Dictionary mapping 'WORD' -> 'Hint text'.
         """
         if not self.grid:
             print("Grid empty, skipping ipuz save.")
             return
 
+        clues_map = clues_map or {}
+        structure_map = structure_map or {}
+
         minx, maxx, miny, maxy = self.bbox()
         w, h = self.width(), self.height()
 
-        # ipuz uses a grid of values.
-        # "puzzle": visualization (integers for numbers, 0 for empty cell, '#' for block)
-        # "solution": letters
         puzzle_grid: List[List[Any]] = [[None] * w for _ in range(h)]
         solution_grid: List[List[Any]] = [[None] * w for _ in range(h)]
         clues: Dict[str, List[List[Any]]] = {"Across": [], "Down": []}
@@ -294,9 +304,6 @@ class CrosswordLayout:
                 solution_grid[r][c] = letter
                 
                 # Determine if this cell starts a word
-                # Across start: Cell to the left is empty/black AND cell to right is letter
-                # Down start: Cell above is empty/black AND cell below is letter
-                
                 left_is_block = (x - 1, y) not in self.grid
                 right_is_letter = (x + 1, y) in self.grid
                 top_is_block = (x, y - 1) not in self.grid
@@ -305,32 +312,45 @@ class CrosswordLayout:
                 is_across = left_is_block and right_is_letter
                 is_down = top_is_block and bottom_is_letter
                 
-                cell_val = 0  # Default for non-numbered letter cell
+                cell_val = 0  
                 
                 if is_across or is_down:
                     cell_val = number
                     number += 1
                     
                     if is_across:
-                        # Reconstruct word for the clue label
+                        # Reconstruct word
                         word_chars = []
                         cx = x
                         while (cx, y) in self.grid:
                             word_chars.append(self.grid[(cx, y)])
                             cx += 1
                         word_str = "".join(word_chars)
-                        # Clue format: [number, text]
-                        clues["Across"].append([cell_val, f"Clue for {word_str}"])
+                        # Look up hint
+                        hint_text = clues_map.get(word_str, f"Clue for {word_str}")
+                        # Check if original word had spaces
+                        orig = structure_map.get(word_str, "")
+                        if " " in orig:
+                            lengths = [len(part) for part in orig.split()]
+                            hint_text = f"{hint_text} ({', '.join(map(str, lengths))})"
+                        clues["Across"].append([cell_val, hint_text])
 
                     if is_down:
-                        # Reconstruct word for the clue label
+                        # Reconstruct word
                         word_chars = []
                         cy = y
                         while (x, cy) in self.grid:
                             word_chars.append(self.grid[(x, cy)])
                             cy += 1
                         word_str = "".join(word_chars)
-                        clues["Down"].append([cell_val, f"Clue for {word_str}"])
+                        # Look up hint
+                        hint_text = clues_map.get(word_str, f"Clue for {word_str}")
+                        # Check if original word had spaces
+                        orig = structure_map.get(word_str, "")
+                        if " " in orig:
+                            lengths = [len(part) for part in orig.split()]
+                            hint_text = f"{hint_text} ({', '.join(map(str, lengths))})"
+                        clues["Down"].append([cell_val, hint_text])
                 
                 puzzle_grid[r][c] = cell_val
 
@@ -350,14 +370,19 @@ class CrosswordLayout:
         print(f"Saved {filename}")
 
 
-def _sanitize_words(words: Iterable[str]) -> List[str]:
+def _clean_word(w: str) -> str:
+    """Standardize words: uppercase, only A-Z."""
+    return re.sub(r"[^A-Za-z]", "", w.strip()).upper()
+
+
+def _sanitize_word_list(words: Iterable[str]) -> List[str]:
     """
     Keep A–Z only, uppercase, drop duplicates, drop very short words (<2).
     """
     out: List[str] = []
     seen: Set[str] = set()
-    for w in words:
-        w = re.sub(r"[^A-Za-z]", "", w.strip()).upper()
+    for w_raw in words:
+        w = _clean_word(w_raw)
         if len(w) < 2:
             continue
         if w in seen:
@@ -383,7 +408,9 @@ def generate_sparse_crossword(
     Build a sparse crossword arrangement from a list of words.
     Returns: (best_layout, unplaced_words)
     """
-    cleaned = _sanitize_words(words)
+    # Sanitize input list
+    cleaned = _sanitize_word_list(words)
+    
     if not cleaned:
         return CrosswordLayout(clearance=clearance), []
 
@@ -504,7 +531,14 @@ def generate_sparse_crossword(
 
                 sparsity_bonus = (target_density - density)
                 area_growth = new_area - layout.area()
-                score = inter * 100 + sparsity_bonus * 800 - area_growth * 0.05 + rng.random() * 0.01
+                new_w = new_maxx - new_minx + 1
+                new_h = new_maxy - new_miny + 1
+                aspect_ratio_penalty = (new_w - new_h)**2
+                score = (inter * 100
+                        + sparsity_bonus * 800
+                        - area_growth * 0.05
+                        - aspect_ratio_penalty * 10.0
+                        + rng.random() * 0.01)
 
                 if best_cand_score is None or score > best_cand_score:
                     best_cand_score = score
@@ -534,28 +568,87 @@ def generate_sparse_crossword(
     return best_layout, best_unplaced
 
 
-if __name__ == "__main__":
-    demo_words = [
-        "python", "code", "crossword", "sparse", "black", "blocks", "grid",
-        "random", "heuristic", "placement", "algorithm", "letters",
-        "json", "ipuz", "standard", "export"
-    ]
-
-    layout, missing = generate_sparse_crossword(
-        demo_words,
-        attempts=300,
-        seed=42,
-        clearance=2,
-        target_density=0.8,
-        max_width=15,
-        max_height=15,
-        allow_islands=True,
-        island_gap=4,
-    )
-
-    print(layout.to_text(pad=1))
-    print()
-    print(f"placed={len(layout.placements)}  missing={missing}")
+def main():
+    parser = argparse.ArgumentParser(description="Batch generate sparse crosswords from a folder of TSV files.")
     
-    # Save the output to an ipuz file
-    layout.save_ipuz("output.ipuz", title="Demo Sparse Crossword")
+    # Input/Output Folders
+    parser.add_argument("--input_dir", help="Directory containing .tsv files")
+    parser.add_argument("--output_dir", help="Directory where .ipuz files will be saved")
+    
+    # Generator Parameters
+    parser.add_argument("--attempts", type=int, default=3000, help="Number of generation attempts per file")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed")
+    parser.add_argument("--clearance", type=int, default=1, help="Distance between non-intersecting words")
+    parser.add_argument("--density", type=float, default=0.35, help="Target fill density (0.0 - 1.0)")
+    parser.add_argument("--width", type=int, default=25, help="Max width constraint")
+    parser.add_argument("--height", type=int, default=25, help="Max height constraint")
+    
+    # Islands
+    parser.add_argument("--no-islands", action="store_true", help="Disable disconnected word islands")
+    parser.add_argument("--island-gap", type=int, default=3, help="Gap size for islands")
+
+    args = parser.parse_args()
+
+    # Ensure output directory exists
+    input_path = Path(args.input_dir)
+    output_path = Path(args.output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    # Find all .tsv files
+    tsv_files = list(input_path.glob("*.tsv"))
+    
+    if not tsv_files:
+        print(f"No .tsv files found in {args.input_dir}")
+        return
+
+    print(f"Found {len(tsv_files)} files to process.")
+
+    for tsv_file in tsv_files:
+        print(f"\nProcessing: {tsv_file.name}")
+        
+        # Prepare output filename: strip .tsv and add .ipuz
+        output_filename = output_path / (tsv_file.stem + ".ipuz")
+        
+        # Read and parse TSV
+        word_hint_map = {}
+        word_structure_map = {}
+        with open(tsv_file, 'r', encoding='utf-8', newline='') as f:
+            reader = csv.reader(f, delimiter='\t')
+            for row in reader:
+                if len(row) < 2:
+                    continue
+                word_raw, hint = row[0], row[1].strip()
+                cleaned_word = _clean_word(word_raw)
+                if len(cleaned_word) >= 2:
+                    word_hint_map[cleaned_word] = hint
+                    word_structure_map[cleaned_word] = word_raw
+
+        words_to_place = list(word_hint_map.keys())
+        if not words_to_place:
+            print(f"Skipping {tsv_file.name}: No valid words found.")
+            continue
+
+        # Generate the layout
+        layout, missing = generate_sparse_crossword(
+            words_to_place,
+            attempts=args.attempts,
+            seed=args.seed,
+            clearance=args.clearance,
+            target_density=args.density,
+            max_width=args.width,
+            max_height=args.height,
+            allow_islands=not args.no_islands,
+            island_gap=args.island_gap,
+        )
+
+        # Save result using the stem name as the title
+        layout.save_ipuz(
+            str(output_filename), 
+            title=tsv_file.stem.replace('_', ' ').title(), 
+            clues_map=word_hint_map,
+            structure_map=word_structure_map,
+        )
+        print(f"Placed {len(layout.placements)} words. Missing: {len(missing)}")
+
+if __name__ == "__main__":
+    main()
