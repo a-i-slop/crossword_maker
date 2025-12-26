@@ -9,6 +9,7 @@ import random
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from tqdm import tqdm
 from typing import Any, DefaultDict, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 Coord = Tuple[int, int]  # (x, y)
@@ -144,6 +145,47 @@ class CrosswordLayout:
         if not self.grid:
             return (0.0, 0.0)
         return ((self.minx + self.maxx) / 2.0, (self.miny + self.maxy) / 2.0)
+    
+    def holes_in_bbox(self) -> int:
+        """Empty cells inside current bbox."""
+        if not self.grid:
+            return 0
+        return max(0, self.area() - len(self.grid))
+
+    def perimeter(self) -> int:
+        """Exposed edge count of occupied cells (lower is more 'blob-like')."""
+        if not self.grid:
+            return 0
+        per = 0
+        for (x, y) in self.grid.keys():
+            if (x - 1, y) not in self.grid:
+                per += 1
+            if (x + 1, y) not in self.grid:
+                per += 1
+            if (x, y - 1) not in self.grid:
+                per += 1
+            if (x, y + 1) not in self.grid:
+                per += 1
+        return per
+
+    def degree1_cells(self) -> int:
+        """Count occupied cells with exactly one orthogonal occupied neighbor."""
+        if not self.grid:
+            return 0
+        d1 = 0
+        for (x, y) in self.grid.keys():
+            deg = 0
+            if (x - 1, y) in self.grid:
+                deg += 1
+            if (x + 1, y) in self.grid:
+                deg += 1
+            if (x, y - 1) in self.grid:
+                deg += 1
+            if (x, y + 1) in self.grid:
+                deg += 1
+            if deg == 1:
+                d1 += 1
+        return d1
 
     def _word_bbox(self, word_len: int, x: int, y: int, direction: str) -> Tuple[int, int, int, int]:
         if direction == "H":
@@ -545,7 +587,19 @@ def _state_key(layout: CrosswordLayout, *, target_density: float) -> Tuple[int, 
     ar = _aspect_ratio(layout)
     # Prefer smaller max side length over bbox area (area tends to reward rectangles)
     max_side = max(layout.width(), layout.height())
-    return (placed, -layout.islands, -(ar - 1.0) * 10.0, -density_diff, -max_side)
+    holes = layout.holes_in_bbox()
+    per = layout.perimeter()
+    d1 = layout.degree1_cells()
+    return (
+        placed, 
+        -holes,      # fewer holes
+        -layout.islands, 
+        -(ar - 1.0) * 10.0, 
+        -density_diff, 
+        -max_side,
+        -per,        # less perimeter
+        -d1,         # fewer dangling cells
+    )
 
 
 def _placement_score(
@@ -572,6 +626,8 @@ def _placement_score(
     new_filled = len(layout.grid) + ev.new_letters
     new_density = new_filled / max(1, new_area)
 
+    holes = max(0, new_area - new_filled)
+
     # centroid / gravity
     cx, cy = layout.centroid()
     half = (meta.length - 1) / 2.0
@@ -589,11 +645,16 @@ def _placement_score(
     w_density = 20.0 + 120.0 * progress
     w_aspect = 40.0 + 80.0 * progress
 
+    # Anneal: early allow exploration, late punish holes hard.
+    w_holes = 5.0 + 80.0 * progress
+
     score_inter = ev.intersections * w_inter + (ev.intersections ** 2) * w_inter2
     score_density = -abs(new_density - target_density) * w_density
 
     score_gravity = -dist * 1.5
     score_aspect = -((new_w - new_h) ** 2) * w_aspect
+
+    score_holes = -holes * w_holes
 
     island_penalty = -500.0 if island else 0.0
 
@@ -603,7 +664,7 @@ def _placement_score(
     # Tiny noise to break ties across attempts
     noise = rng.random() * 1e-6
 
-    return score_inter + score_density + score_gravity + score_aspect + island_penalty + touch_pen + noise
+    return score_inter + score_density + score_gravity + score_aspect + score_holes + island_penalty + touch_pen + noise
 
 
 def _approx_anchor_potential(layout: CrosswordLayout, wm: WordMeta) -> int:
@@ -944,7 +1005,7 @@ def _beam_attempt(
                     d,
                     max_width=max_width,
                     max_height=max_height,
-                    require_intersection=False,  # safe for islands too
+                    require_intersection=(not allow_islands),
                     valid_words=valid_words,
                 )
                 if ev is None:
@@ -992,17 +1053,7 @@ def generate_sparse_crossword(
     word_choices: int = 3,
     max_word_scan: int = 12,
 ) -> Tuple[CrosswordLayout, List[str]]:
-    """
-    Build a sparse crossword arrangement.
-
-    Key improvements vs your original:
-      - One-pass eval_place (no coordinate list allocations)
-      - Crossable anchor index (direction-aware letter anchors)
-      - Candidate dedup for repeated letters
-      - MRV-ish ordering + optional beam search (beam_width > 1)
-
-    beam_width=1 behaves like an improved greedy; increase beam_width to place more words.
-    """
+    """Build a sparse crossword arrangement with progress tracking."""
     cleaned = _sanitize_word_list(words)
     if not cleaned:
         return CrosswordLayout(clearance=clearance), []
@@ -1031,16 +1082,17 @@ def generate_sparse_crossword(
     # (placed_count, -components, -density_diff, -area)
     best_score: Tuple[int, int, float, int] = (-1, -9999, -9999.0, -999999)
 
-    for attempt in range(max(1, attempts)):
+    # Inner progress bar for attempts on a single file
+    # leave=False hides this bar once the attempts for this file are complete
+    pbar = tqdm(range(max(1, attempts)), desc="  Attempts", leave=False)
+
+    for attempt in pbar:
         rng = random.Random(base_seed + attempt * 99991)
 
-        # Keep a stable spine, shuffle tail for diversity
+        # shuffle for diversity
         working = cleaned[:]
-        if attempt > 0 and len(working) > 3:
-            spine = working[:3]
-            tail = working[3:]
-            rng.shuffle(tail)
-            working = spine + tail
+        if attempt > 0:
+            rng.shuffle(working)
 
         layout, unplaced = _beam_attempt(
             working,
@@ -1069,6 +1121,8 @@ def generate_sparse_crossword(
             best_score = score
             best_layout = layout
             best_unplaced = unplaced
+            # Show the current best placement count in the progress bar suffix
+            pbar.set_postfix({"placed": f"{placed_count}/{len(cleaned)}"})
 
     assert best_layout is not None
     return best_layout, best_unplaced
@@ -1091,7 +1145,6 @@ def main() -> None:
     parser.add_argument("--islands", action="store_true", help="Enable disconnected word islands (defaults to False)")
     parser.add_argument("--island-gap", type=int, default=1, help="Gap size for islands")
 
-    # New search controls
     parser.add_argument("--beam-width", type=int, default=20, help="Beam width (1 = greedy; higher places more words)")
     parser.add_argument("--branch-factor", type=int, default=20, help="Top placements kept per expanded word")
     parser.add_argument("--word-choices", type=int, default=6, help="How many MRV words to branch on per state")
@@ -1112,10 +1165,8 @@ def main() -> None:
         print(f"No .tsv files found in {args.input_dir}")
         return
 
-    print(f"Found {len(tsv_files)} files to process.")
-
-    for tsv_file in tsv_files:
-        print(f"\nProcessing: {tsv_file.name}")
+    # Outer progress bar for the total list of files
+    for tsv_file in tqdm(tsv_files, desc="Total Files"):
         output_filename = output_path / (tsv_file.stem + ".ipuz")
 
         word_hint_map: Dict[str, str] = {}
@@ -1133,7 +1184,7 @@ def main() -> None:
                         word_hint_map[cleaned] = hint
                         word_structure_map[cleaned] = word_raw
         except Exception as e:
-            print(f"Error reading {tsv_file}: {e}")
+            tqdm.write(f"Error reading {tsv_file}: {e}")
             continue
 
         words_to_place = list(word_hint_map.keys())
@@ -1166,11 +1217,16 @@ def main() -> None:
         )
 
         final_d = layout.density()
-        print(f"Placed {len(layout.placements)}/{len(words_to_place)} words.")
-        print(f"Grid Size: {layout.width()}x{layout.height()} (Density: {final_d:.2f})")
-        if missing:
-            print(f"Missing: {', '.join(missing[:5])}{'...' if len(missing) > 5 else ''}")
 
+        # Use tqdm.write so log messages don't break the progress bar UI
+        tqdm.write(
+            f"Completed {tsv_file.name}: {len(layout.placements)}/{len(words_to_place)} placed.\n"
+            f"Grid Size: {layout.width()}x{layout.height()} (Density: {final_d:.2f})"
+        )
+        if missing:
+            preview = ", ".join(missing[:5])
+            suffix = "..." if len(missing) > 5 else ""
+            tqdm.write(f"Missing ({len(missing)}): {preview}{suffix}")
 
 if __name__ == "__main__":
     main()
