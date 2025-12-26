@@ -37,6 +37,70 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 # Match enumeration at the very end with 2+ numbers separated by comma, dash, or slash:
 #   "(2, 5)" or "(3,5,2)" or "(2-5)" or "(3/5/2)"
 ENUM_RE = re.compile(r"\((\s*\d+\s*(?:[,\-/]\s*\d+\s*)+)\)\s*$")
+ENUM_LEN_RE = re.compile(r"\(\s*(\d+)\s*\)\s*$")
+
+import re
+
+# segmentation: (2, 5) / (3, 5, 2) / (2-5) / (3/5/2)
+ENUM_SEG_RE = re.compile(r"\((\s*\d+\s*(?:[,\-/]\s*\d+\s*)+)\)\s*$")
+# length-only: (3) / (6)
+ENUM_LEN_RE = re.compile(r"\(\s*(\d+)\s*\)\s*$")
+
+
+def enum_parts_from_hint(hint: str):
+    """Return list of segment lengths if hint ends with (2, 5, ...) etc; else None."""
+    m = ENUM_SEG_RE.search(hint)
+    if not m:
+        return None
+    parts = [int(x) for x in re.findall(r"\d+", m.group(1))]
+    return parts if len(parts) >= 2 else None
+
+
+def strip_trailing_enumeration(hint: str) -> str:
+    """Strip either (n) or (a, b, ...) from the very end of the clue text."""
+    hint = ENUM_SEG_RE.sub("", hint).rstrip()
+    hint = ENUM_LEN_RE.sub("", hint).rstrip()
+    return hint
+
+
+def insert_spaces_from_parts(answer: str, parts):
+    """
+    Insert spaces after cumulative segment sizes (excluding last segment).
+    (3,5,2) -> after 3 and 8
+    """
+    raw = re.sub(r"[\s-]+", "", answer).strip()
+    if not raw:
+        return raw
+
+    cut_positions = []
+    cum = 0
+    for seg in parts[:-1]:
+        cum += seg
+        cut_positions.append(cum)
+
+    out = []
+    for i, ch in enumerate(raw, start=1):
+        out.append(ch)
+        if i in cut_positions:
+            out.append(" ")
+    return "".join(out).strip()
+
+
+def format_answer_and_hint(answer: str, hint: str) -> tuple[str, str]:
+    """
+    - If hint ends with (n): strip it from hint, leave answer unchanged.
+    - If hint ends with (a, b, ...): strip it from hint AND insert spaces into answer.
+    - Else: leave both unchanged.
+    """
+    parts = enum_parts_from_hint(hint)
+    hint_out = strip_trailing_enumeration(hint)
+
+    if parts:
+        answer_out = insert_spaces_from_parts(answer, parts)
+    else:
+        answer_out = answer
+
+    return answer_out, hint_out
 
 
 def _unwrap_cell(cell: Any) -> Any:
@@ -425,10 +489,10 @@ def convert_ipuz_to_tsv(
                     return 3
 
             answer = answer.strip()
-            answer = maybe_apply_enumeration_spacing(answer, hint)
+            answer_out, hint_out = format_answer_and_hint(answer, hint)
 
             # TSV row: answer<TAB>hint
-            out_f.write(f"{answer}\t{hint_out}\n")
+            out_f.write(f"{answer_out}\t{hint_out}\n")
             written_count += 1
 
     finally:
