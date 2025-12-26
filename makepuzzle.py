@@ -31,6 +31,7 @@ class PlaceEval:
     """Result of checking feasibility + geometry in one pass."""
     intersections: int
     new_letters: int
+    touches: int
     minx: int
     maxx: int
     miny: int
@@ -159,6 +160,50 @@ class CrosswordLayout:
         self.minx, self.maxx = min(xs), max(xs)
         self.miny, self.maxy = min(ys), max(ys)
 
+    def _perp_word_after_letter(
+        self,
+        x: int,
+        y: int,
+        letter: str,
+        placed_direction: str,
+    ) -> Optional[str]:
+        """
+        If we were to place `letter` at (x, y) as part of a word placed in `placed_direction`,
+        return the perpendicular entry (Across/Down) that would exist through (x, y).
+        Returns None if the perpendicular run length would be < 2.
+        """
+        if placed_direction == "H":
+            # Perpendicular is vertical (Down).
+            y0 = y
+            while (x, y0 - 1) in self.grid:
+                y0 -= 1
+            y1 = y
+            while (x, y1 + 1) in self.grid:
+                y1 += 1
+            if (y1 - y0 + 1) < 2:
+                return None
+            chars: List[str] = []
+            for yy in range(y0, y1 + 1):
+                chars.append(letter if yy == y else self.grid[(x, yy)])
+            return "".join(chars)
+
+        if placed_direction == "V":
+            # Perpendicular is horizontal (Across).
+            x0 = x
+            while (x0 - 1, y) in self.grid:
+                x0 -= 1
+            x1 = x
+            while (x1 + 1, y) in self.grid:
+                x1 += 1
+            if (x1 - x0 + 1) < 2:
+                return None
+            chars: List[str] = []
+            for xx in range(x0, x1 + 1):
+                chars.append(letter if xx == x else self.grid[(xx, y)])
+            return "".join(chars)
+
+        raise ValueError("placed_direction must be 'H' or 'V'")
+
     def eval_place(
         self,
         word: str,
@@ -169,6 +214,7 @@ class CrosswordLayout:
         max_width: Optional[int] = None,
         max_height: Optional[int] = None,
         require_intersection: bool = True,
+        valid_words: Optional[Set[str]] = None,
     ) -> Optional[PlaceEval]:
         """
         Check if a word can be placed, computing geometry in one scan.
@@ -213,6 +259,7 @@ class CrosswordLayout:
 
         intersections = 0
         new_letters = 0
+        touches = 0
 
         cx, cy = x, y
         for i in range(L):
@@ -234,6 +281,20 @@ class CrosswordLayout:
                         for ox, oy in perp:
                             if (cx + ox * dist, cy + oy * dist) in self.grid:
                                 return None
+                else:
+                    # clearance == 0: touching is only allowed if it doesn't create invalid
+                    # perpendicular (Across/Down) entries. Otherwise you get stray 2-letter "words".
+                    cell_touches = 0
+                    for ox, oy in perp:
+                        if (cx + ox, cy + oy) in self.grid:
+                            cell_touches += 1
+                    if cell_touches:
+                        touches += cell_touches
+                        if valid_words is not None:
+                            perp_word = self._perp_word_after_letter(cx, cy, ch, direction)
+                            if perp_word is not None and perp_word not in valid_words:
+                                return None
+            
             cx += dx
             cy += dy
 
@@ -243,6 +304,7 @@ class CrosswordLayout:
         return PlaceEval(
             intersections=intersections,
             new_letters=new_letters,
+            touches=touches,
             minx=minx,
             maxx=maxx,
             miny=miny,
@@ -483,7 +545,7 @@ def _state_key(layout: CrosswordLayout, *, target_density: float) -> Tuple[int, 
     ar = _aspect_ratio(layout)
     # Prefer smaller max side length over bbox area (area tends to reward rectangles)
     max_side = max(layout.width(), layout.height())
-    return (placed, -layout.islands, -(ar - 1.0) * 1000.0, -density_diff, -max_side)
+    return (placed, -layout.islands, -(ar - 1.0) * 10.0, -density_diff, -max_side)
 
 
 def _placement_score(
@@ -498,6 +560,7 @@ def _placement_score(
     progress: float,
     rng: random.Random,
     island: bool,
+    touch_penalty: float,
 ) -> float:
     """
     Score a candidate placement. Higher is better.
@@ -518,11 +581,15 @@ def _placement_score(
         midx, midy = x, y + half
     dist = math.hypot(midx - cx, midy - cy)
 
-    # Annealed weights: care more about density/aspect later.
-    w_density = 20.0 + 120.0 * (progress ** 2)
-    w_aspect = 2000.0 + 1000.0 * (progress ** 2)
+    # Strongly favor crossings; increasingly so later.
+    w_inter = 250.0 + 400.0 * progress
+    w_inter2 = 60.0 + 80.0 * progress  # bonus for multi-cross
 
-    score_inter = (ev.intersections ** 2) * 10.0
+    # Annealed weights: care more about density/aspect later.
+    w_density = 20.0 + 120.0 * progress
+    w_aspect = 40.0 + 80.0 * progress
+
+    score_inter = ev.intersections * w_inter + (ev.intersections ** 2) * w_inter2
     score_density = -abs(new_density - target_density) * w_density
 
     score_gravity = -dist * 1.5
@@ -530,10 +597,13 @@ def _placement_score(
 
     island_penalty = -500.0 if island else 0.0
 
+    # Only meaningful when clearance==0, but safe either way.
+    touch_pen = -touch_penalty * ev.touches
+
     # Tiny noise to break ties across attempts
     noise = rng.random() * 1e-6
 
-    return score_inter + score_density + score_gravity + score_aspect + island_penalty + noise
+    return score_inter + score_density + score_gravity + score_aspect + island_penalty + touch_pen + noise
 
 
 def _approx_anchor_potential(layout: CrosswordLayout, wm: WordMeta) -> int:
@@ -559,6 +629,8 @@ def _gen_intersecting_candidates(
     progress: float,
     rng: random.Random,
     keep_top: int,
+    touch_penalty: float,
+    valid_words: Optional[Set[str]] = None,
 ) -> List[Tuple[float, int, int, str]]:
     """
     Generate top-N intersecting candidates for a word, deduplicated.
@@ -596,6 +668,7 @@ def _gen_intersecting_candidates(
                         max_width=max_width,
                         max_height=max_height,
                         require_intersection=True,
+                        valid_words=valid_words,
                     )
                     if ev is None:
                         continue
@@ -611,6 +684,7 @@ def _gen_intersecting_candidates(
                         progress=progress,
                         rng=rng,
                         island=False,
+                        touch_penalty=touch_penalty,
                     )
 
                     if len(heap) < keep_top:
@@ -634,6 +708,8 @@ def _gen_island_candidates(
     rng: random.Random,
     keep_top: int,
     island_gap: int,
+    touch_penalty: float,
+    valid_words: Optional[Set[str]] = None,
 ) -> List[Tuple[float, int, int, str]]:
     """
     Generate a small set of good island placements around the bbox.
@@ -652,6 +728,7 @@ def _gen_island_candidates(
             max_width=max_width,
             max_height=max_height,
             require_intersection=False,
+            valid_words=valid_words,
         )
         if ev is None:
             return []
@@ -666,6 +743,8 @@ def _gen_island_candidates(
             progress=progress,
             rng=rng,
             island=False,
+            touch_penalty=touch_penalty,
+            valid_words=valid_words,
         )
         return [(score, 0, 0, "H")]
 
@@ -701,6 +780,7 @@ def _gen_island_candidates(
             max_width=max_width,
             max_height=max_height,
             require_intersection=False,
+            valid_words=valid_words,
         )
         if ev is None:
             continue
@@ -717,6 +797,7 @@ def _gen_island_candidates(
             progress=progress,
             rng=rng,
             island=island_flag,
+            touch_penalty=touch_penalty,
         )
 
         if len(heap) < keep_top:
@@ -736,6 +817,7 @@ def _beam_attempt(
     rng: random.Random,
     clearance: int,
     target_density: float,
+    touch_penalty: float,
     max_width: Optional[int],
     max_height: Optional[int],
     allow_islands: bool,
@@ -744,6 +826,7 @@ def _beam_attempt(
     branch_factor: int,
     word_choices: int,
     max_word_scan: int,
+    valid_words: Set[str],
 ) -> Tuple[CrosswordLayout, List[str]]:
     """
     One attempt using beam search (beam_width=1 behaves like an improved greedy).
@@ -815,6 +898,8 @@ def _beam_attempt(
                         progress=progress,
                         rng=rng,
                         keep_top=branch_factor,
+                        touch_penalty=touch_penalty,
+                        valid_words=valid_words,
                     )
                     for score, x, y, d in cands:
                         push_child(score, x, y, d, w)
@@ -837,6 +922,8 @@ def _beam_attempt(
                     rng=rng,
                     keep_top=branch_factor,
                     island_gap=island_gap,
+                    touch_penalty=touch_penalty,
+                    valid_words=valid_words,
                 )
                 for score, x, y, d in cands:
                     push_child(score, x, y, d, w)
@@ -858,6 +945,7 @@ def _beam_attempt(
                     max_width=max_width,
                     max_height=max_height,
                     require_intersection=False,  # safe for islands too
+                    valid_words=valid_words,
                 )
                 if ev is None:
                     # Shouldn't happen, but skip if mismatch
@@ -893,6 +981,7 @@ def generate_sparse_crossword(
     attempts: int = 50,
     seed: Optional[int] = None,
     clearance: int = 2,
+    touch_penalty: float = 0.0,
     target_density: float = 0.5,
     max_width: Optional[int] = None,
     max_height: Optional[int] = None,
@@ -933,6 +1022,7 @@ def generate_sparse_crossword(
     cleaned.sort(key=len, reverse=True)
 
     meta = _build_word_meta(cleaned)
+    valid_words_set = set(cleaned)
 
     base_seed = seed if seed is not None else random.randrange(1 << 30)
 
@@ -958,6 +1048,7 @@ def generate_sparse_crossword(
             rng=rng,
             clearance=clearance,
             target_density=target_density,
+            touch_penalty=touch_penalty,
             max_width=max_width,
             max_height=max_height,
             allow_islands=allow_islands,
@@ -966,6 +1057,7 @@ def generate_sparse_crossword(
             branch_factor=branch_factor,
             word_choices=word_choices,
             max_word_scan=max_word_scan,
+            valid_words=valid_words_set,
         )
 
         placed_count = len(layout.placements)
@@ -989,20 +1081,21 @@ def main() -> None:
 
     parser.add_argument("--attempts", type=int, default=50, help="Number of generation attempts / restarts")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
-    parser.add_argument("--clearance", type=int, default=1, help="Distance between non-intersecting words")
+    parser.add_argument("--clearance", type=int, default=0, help="Distance between non-intersecting words")
+    parser.add_argument("--touch-penalty", type=float, default=0.0, help="Penalty per perpendicular adjacency when --clearance=0 (0 = no penalty).")
 
-    parser.add_argument("--density", type=float, default=0.5, help="Target density (0.0 - 1.0). Higher = more compact.")
-    parser.add_argument("--width", type=int, default=30, help="Max width constraint")
-    parser.add_argument("--height", type=int, default=30, help="Max height constraint")
+    parser.add_argument("--density", type=float, default=0.8, help="Target density (0.0 - 1.0). Higher = more compact.")
+    parser.add_argument("--width", type=int, default=23, help="Max width constraint")
+    parser.add_argument("--height", type=int, default=23, help="Max height constraint")
 
     parser.add_argument("--islands", action="store_true", help="Enable disconnected word islands (defaults to False)")
     parser.add_argument("--island-gap", type=int, default=1, help="Gap size for islands")
 
     # New search controls
-    parser.add_argument("--beam-width", type=int, default=1, help="Beam width (1 = greedy; higher places more words)")
-    parser.add_argument("--branch-factor", type=int, default=12, help="Top placements kept per expanded word")
-    parser.add_argument("--word-choices", type=int, default=3, help="How many MRV words to branch on per state")
-    parser.add_argument("--max-word-scan", type=int, default=12, help="Max words scanned per state expansion")
+    parser.add_argument("--beam-width", type=int, default=20, help="Beam width (1 = greedy; higher places more words)")
+    parser.add_argument("--branch-factor", type=int, default=20, help="Top placements kept per expanded word")
+    parser.add_argument("--word-choices", type=int, default=6, help="How many MRV words to branch on per state")
+    parser.add_argument("--max-word-scan", type=int, default=100, help="Max words scanned per state expansion")
 
     args = parser.parse_args()
 
@@ -1053,6 +1146,7 @@ def main() -> None:
             attempts=args.attempts,
             seed=args.seed,
             clearance=args.clearance,
+            touch_penalty=args.touch_penalty,
             target_density=args.density,
             max_width=args.width,
             max_height=args.height,
